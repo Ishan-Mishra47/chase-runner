@@ -6,12 +6,19 @@ export class Input {
   private pressedThisFrame = new Set<string>();
   private seq = 0;
   private downSeq = new Map<string, number>();
+  private jumpBufferedUntil = 0;
   readonly move = new Vector2();
 
   constructor(target: EventTarget = window) {
     target.addEventListener("keydown", (e) => {
       const k = (e as KeyboardEvent).code;
-      if (!this.down.has(k)) this.pressedThisFrame.add(k);
+      if (!this.down.has(k)) {
+        this.pressedThisFrame.add(k);
+        if (k === "Space") {
+          // Buffer jump for 160ms so fixed-tick physics never misses a press
+          this.jumpBufferedUntil = performance.now() + 160;
+        }
+      }
       this.down.add(k);
       this.downSeq.set(k, ++this.seq);
       if (k === "Space") e.preventDefault();
@@ -24,6 +31,7 @@ export class Input {
     window.addEventListener("blur", () => {
       this.down.clear();
       this.downSeq.clear();
+      this.jumpBufferedUntil = 0;
     });
   }
 
@@ -34,6 +42,19 @@ export class Input {
   /** True only on the frame the key went down. */
   pressed(code: string) {
     return this.pressedThisFrame.has(code);
+  }
+
+  /**
+   * Consumes a jump if one was pressed recently (160ms buffer).
+   * Prevents multi-tick re-triggers within the same keyboard press.
+   */
+  consumeJump(): boolean {
+    if (performance.now() <= this.jumpBufferedUntil) {
+      this.jumpBufferedUntil = 0;
+      this.pressedThisFrame.delete("Space");
+      return true;
+    }
+    return false;
   }
 
   /** Call once per frame, after everything has read the input. */
@@ -69,7 +90,8 @@ export class Input {
   get sprint() {
     return this.held("ShiftLeft") || this.held("ShiftRight");
   }
+
   get jump() {
-    return this.pressed("Space");
+    return this.pressed("Space") || performance.now() <= this.jumpBufferedUntil;
   }
 }

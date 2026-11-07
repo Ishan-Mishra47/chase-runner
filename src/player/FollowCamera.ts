@@ -26,9 +26,13 @@ export class FollowCamera {
   /** Mouse look sensitivity, radians per pixel. */
   sensitivity = 0.005;
   invertY = false;
+  /** Horizontal shoulder offset in metres: 0 = dead-center, >0 = right, <0 = left. */
+  shoulderOffset = 0;
   private readonly target = new Vector3();
+  private readonly desiredTarget = new Vector3();
   private readonly desired = new Vector3();
   private readonly ray = new Raycaster();
+  private hasInitialized = false;
   /** Eye level is ~0.75 m on a 1.20 m character — frame that, not the hair. */
   private readonly eyeHeight = 0.75;
   private dragging = false;
@@ -83,7 +87,7 @@ export class FollowCamera {
     this.pitch = clamp(this.pitch + sign * dy * this.sensitivity * 0.6, PITCH_MIN, PITCH_MAX);
   }
 
-  private requestLock() {
+  requestLock() {
     // Chrome rejects the request if it is not inside a user gesture, and throws
     // if the element is already locked — neither is worth failing a frame over.
     const r = this.dom.requestPointerLock?.() as unknown;
@@ -103,21 +107,28 @@ export class FollowCamera {
   update(dt: number, follow: Object3D, collider?: Mesh, keyboardYaw = 0) {
     this.yaw += keyboardYaw * dt * 2;
 
-    this.target.copy(follow.position);
-    this.target.y += this.eyeHeight;
+    this.desiredTarget.copy(follow.position);
+    this.desiredTarget.y += this.eyeHeight;
+
+    const rightX = Math.cos(this.yaw);
+    const rightZ = -Math.sin(this.yaw);
+    if (this.shoulderOffset !== 0) {
+      this.desiredTarget.x += rightX * this.shoulderOffset;
+      this.desiredTarget.z += rightZ * this.shoulderOffset;
+    }
 
     const horiz = Math.cos(this.pitch) * this.distance;
     this.desired.set(
-      this.target.x + Math.sin(this.yaw) * horiz,
-      this.target.y + Math.sin(this.pitch) * this.distance,
-      this.target.z + Math.cos(this.yaw) * horiz,
+      this.desiredTarget.x + Math.sin(this.yaw) * horiz,
+      this.desiredTarget.y + Math.sin(this.pitch) * this.distance,
+      this.desiredTarget.z + Math.cos(this.yaw) * horiz,
     );
 
     // Pull in if a building is in the way, so the player never gets occluded.
     if (collider) {
-      const dir = this.desired.clone().sub(this.target);
+      const dir = this.desired.clone().sub(this.desiredTarget);
       const len = dir.length();
-      this.ray.set(this.target, dir.divideScalar(len));
+      this.ray.set(this.desiredTarget, dir.divideScalar(len));
       this.ray.far = len;
       const hit = this.ray.intersectObject(collider, false)[0];
       // Never pull in closer than MIN_PULL_IN: a canopy directly overhead would
@@ -130,8 +141,15 @@ export class FollowCamera {
       }
     }
 
-    const k = 1 - Math.exp(-10 * dt);
-    this.camera.position.lerp(this.desired, k);
+    if (!this.hasInitialized) {
+      this.hasInitialized = true;
+      this.target.copy(this.desiredTarget);
+      this.camera.position.copy(this.desired);
+    } else {
+      const k = 1 - Math.exp(-14 * dt);
+      this.target.lerp(this.desiredTarget, k);
+      this.camera.position.lerp(this.desired, k);
+    }
     this.camera.lookAt(this.target);
   }
 }

@@ -224,7 +224,7 @@ export async function loadMap(
   merged.boundsTree = new MeshBVH(merged);
   console.info(
     `[map] collision: ${collisionGeoms.length} meshes, ` +
-      `${merged.index!.count / 3} tris, BVH in ${(performance.now() - t0).toFixed(0)} ms`,
+    `${merged.index!.count / 3} tris, BVH in ${(performance.now() - t0).toFixed(0)} ms`,
   );
   const collision = new Mesh(merged, new MeshStandardMaterial({ wireframe: true }));
   collision.visible = false;

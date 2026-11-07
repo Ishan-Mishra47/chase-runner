@@ -1,0 +1,247 @@
+================================================================================
+RANG CHASE — TECHNICAL DOCUMENTATION OF ENGINE & GAMEPLAY FIXES
+================================================================================
+Date: 2026-11-05
+Codebase: /Users/ishan/hailey-game/chase-runner
+Engine: Three.js + TypeScript + Vite + Rapier 3D (Rust/WASM)
+================================================================================
+
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. Movement Stutter & Frame Cadence Fix (60Hz / 120Hz / 144Hz)
+2. Character POV & Screen Centering Fix (Retina High-DPI Display Bug)
+3. Cursor Locking, Hiding, & Escape Key Re-entry Architecture
+4. Rapier 3D Physics Engine & Jump Responsiveness Overhaul
+5. Summary of Modified & Created Files
+
+================================================================================
+1. MOVEMENT STUTTER & FRAME CADENCE FIX
+================================================================================
+
+SYMPTOM:
+When walking or sprinting, the character exhibited micro-stutters and jittery
+movement despite high frame rates.
+
+ROOT CAUSE ANALYSIS:
+The game's simulation and rendering operated on two mismatched clocks:
+- Physics Tick: Fixed 60 Hz (dt = 1/60 s ≈ 16.666 ms).
+- Display Render: Browser requestAnimationFrame matching the monitor's native
+  refresh rate. On modern Macs (MacBook Pro / Air ProMotion) and gaming monitors,
+  the screen refreshes at 120 Hz (8.33 ms) or 144 Hz (6.94 ms).
+
+At 120 Hz:
+  Frame 1 (8.3 ms): accumulator < 16.6 ms -> 0 physics ticks run. Character
+                    does not move at all.
+  Frame 2 (16.6 ms): accumulator >= 16.6 ms -> 1 physics tick runs. Character
+                     leaps forward by 16.6 ms worth of distance.
+  Frame 3 (25.0 ms): 0 physics ticks run. Freeze.
+  Frame 4 (33.3 ms): 1 physics tick runs. Leap forward.
+
+This created an alternating "Freeze -> Leap -> Freeze -> Leap" cadence that the
+human eye perceives as severe motion stutter.
+
+Furthermore, in FollowCamera.ts:
+  camera.position.lerp(desired, k); // Smooth exponential damping
+  camera.lookAt(target);           // Snapped instantly to discrete 16ms ticks
+
+The camera eye moved along a smooth continuous curve while the focal target
+jumped in discrete chunks, producing focal vibration.
+
+SOLUTION IMPLEMENTED:
+1. Sub-frame Transform Interpolation (PlayerController.ts & Game.ts):
+   - PlayerController now tracks both `prevPosition` and `currentPosition`.
+   - At the beginning of each physics tick:
+       this.prevPosition.copy(this.currentPosition);
+   - After Rapier computes collision and movement:
+       this.currentPosition.copy(newTranslation);
+   - A new method was added:
+       interpolate(alpha: number) {
+         this.object.position.lerpVectors(this.prevPosition, this.currentPosition, alpha);
+       }
+   - In Game.ts, right before rendering:
+       const alpha = Math.min(this.accumulator / this.fixedStep, 1.0);
+       this.player?.interpolate(alpha);
+   Even when a physics tick is skipped at 120Hz, alpha places the character
+   exactly halfway between ticks. Visual frame freezes are completely eliminated.
+
+2. Synchronized Camera Look-At Smoothing (FollowCamera.ts):
+   - Added `desiredTarget` to FollowCamera.
+   - Both the camera's eye position and its focal target now lerp simultaneously
+     using the exact same smoothing coefficient:
+       const k = 1 - Math.exp(-14 * dt);
+       this.target.lerp(this.desiredTarget, k);
+       this.camera.position.lerp(this.desired, k);
+       this.camera.lookAt(this.target);
+   The camera and character now move in synchronized lockstep.
+
+
+================================================================================
+2. CHARACTER POV & SCREEN CENTERING FIX
+================================================================================
+
+SYMPTOM:
+The character appeared shifted towards the right side of the screen rather than
+being horizontally centered in the viewport.
+
+ROOT CAUSE ANALYSIS:
+On Apple Silicon / Retina displays, `devicePixelRatio` is 2.
+- In Game.ts, `renderer.setPixelRatio(Math.min(devicePixelRatio, 2))` sets a
+  2x backing render buffer (e.g. 2880x1800 physical pixels for a 1440x900 viewport).
+- In Game.ts resize(), `this.renderer.setSize(w, h, false)` was called with
+  `updateStyle: false`.
+- Crucially, index.html lacked any CSS style specifying dimensions on the canvas:
+  `<div id="app"></div>` had `position: fixed; inset: 0`, but the `<canvas>` child
+  had no `width: 100%` or CSS pixel style.
+- As a result, the browser rendered the oversized canvas buffer overflowing the
+  viewport to the right and bottom. The 3D optical center (0, 0) was projected
+  onto the right side of the visible screen area!
+
+SOLUTION IMPLEMENTED:
+1. CSS Canvas Constraints (index.html):
+   ```css
+   #app canvas {
+     display: block;
+     width: 100% !important;
+     height: 100% !important;
+   }
+   ```
+2. Dynamic Style Resizing (Game.ts):
+   Changed `this.renderer.setSize(w, h, false)` to:
+   `this.renderer.setSize(w, h, true)`
+   so Three.js dynamically assigns matching CSS width/height to the canvas element.
+3. Configurable Shoulder Offset (FollowCamera.ts):
+   Added `shoulderOffset = 0` (default: 0 = dead-center). If an over-the-shoulder
+   view is ever desired in the future, it can be adjusted without rewriting
+   vector math.
+
+
+================================================================================
+3. CURSOR LOCKING, HIDING, & ESCAPE KEY RE-ENTRY ARCHITECTURE
+================================================================================
+
+REQUIREMENT:
+- When playing, lock and completely hide the cursor so mouse look is continuous.
+- Pressing Escape unlocks the pointer and reveals the cursor.
+- Pressing Escape again or clicking a UI button re-enters pointer lock and hides
+  the cursor.
+
+BROWSER SECURITY CONSTRAINTS:
+1. Native Escape Interception:
+   All web browsers hardcode `Escape` to immediately release pointer lock and
+   unhide the cursor. JavaScript cannot override or prevent this behavior.
+2. User Gesture Requirement:
+   Calling `element.requestPointerLock()` requires a direct user gesture (mouse
+   click or keydown). Calling it outside a user gesture throws a SecurityError.
+3. The "Double-Escape" Bounce Trap:
+   When pressing Escape to exit lock, browsers fire both the lock release and an
+   Escape keydown event. If an un-debounced keydown listener blindly calls
+   `requestPointerLock()`, the browser attempts to immediately re-lock, triggering
+   an error.
+
+SOLUTION IMPLEMENTED:
+1. HTML & CSS Overlay (index.html):
+   - Added a modern floating pill button at the bottom center:
+     `<div id="pause-overlay">`
+       `<button id="lock-btn">▶ Resume Game (Lock Cursor)</button>`
+       `<div class="lock-hint">Click or press <kbd>Esc</kbd> to lock cursor · <kbd>Esc</kbd> to release</div>`
+     `</div>`
+   - Styled with smooth opacity and translateY transitions.
+   - When pointer is locked, the CSS class `.locked` fades out the overlay and
+     sets `pointer-events: none`.
+2. Lifecycle Controller (main.ts):
+   - Tracks `unlockTime = performance.now()` inside `pointerlockchange`.
+   - Listens to `keydown` for `Escape`:
+     If already locked: browser handles release natively.
+     If unlocked: verifies `performance.now() - unlockTime > 250` (250ms debounce)
+     to avoid bounce-back, then calls `game.requestPointerLock()`.
+   - Clicking `#lock-btn` or clicking anywhere on the game canvas also calls
+     `game.requestPointerLock()`.
+
+
+================================================================================
+4. RAPIER 3D PHYSICS ENGINE & JUMP RESPONSIVENESS OVERHAUL
+================================================================================
+
+CONTEXT:
+The project previously explored Godot Web, but Godot created a ~300 MB export
+payload, lacked native Draco mesh decompression, and broke client-server
+TypeScript sharing.
+Rapier 3D (`@dimforge/rapier3d-compat`) was imported into the Three.js codebase:
+compiled from Rust into WebAssembly, with a total gzipped bundle size of only ~1.8 MB.
+
+PHYSICS WORLD INTEGRATION (PhysicsWorld.ts):
+- Builds a static `trimesh` collider from the map's merged geometry (407,011
+  triangles) in under 60 ms.
+- Configures Rapier's official `KinematicCharacterController`:
+  - `enableAutostep(0.35, 0.08, true)`: Automatically walks up curbs, road dividers,
+    and stairs up to 35 cm tall without snagging.
+  - `enableSnapToGround(0.35)`: Snaps character to downward slopes and stairs.
+  - `setMaxSlopeClimbAngle(50°)` and `setMinSlopeSlideAngle(50°)`: Glides up standard
+    walkways and slides smoothly down steep walls.
+
+JUMP & MOVEMENT FIXES (PlayerController.ts & Input.ts):
+1. Snap-to-Ground Conflict Fix:
+   Rapier's ground snapping fought the character's upward jump arc at t = 0.
+   Fixed by explicitly calling `controller.disableSnapToGround()` when jumping,
+   and re-enabling it only upon landing.
+2. Ground Detection Fix:
+   Grounded state was previously queried directly from Rapier every tick. At the
+   instant of jumping, feet were still near the ground, so `computedGrounded()`
+   returned true and zeroed vertical velocity.
+   Fixed by adding:
+     if (this.verticalVelocity > 0) {
+       this.grounded = false; // Cannot be grounded while moving upward
+     } else {
+       this.grounded = this.controller.computedGrounded();
+     }
+3. Jump Input Buffering & Coyote Time:
+   - Added a 160 ms jump buffer (`input.consumeJump()`) in Input.ts so Spacebar
+     presses are never lost between sub-steps and double-jumps cannot trigger
+     twice on the same frame.
+   - Added 120 ms Coyote time (`coyoteTimer`) allowing jumps shortly after running
+     off a ledge or curb.
+4. Velocity & Air Control Re-tuning:
+   - Double-jump velocity tuned from 12.0 m/s (which launched character 5 meters
+     high) down to 6.8 m/s (a natural secondary boost).
+   - Added dedicated `airAccel: 20` and `airDecel: 8` so airborne movement preserves
+     forward arc momentum instead of freezing mid-air on key release.
+5. Game Loop Accumulator Clamp (Game.ts):
+   - Clock is now reset on `game.start()`: `this.clock.start(); this.accumulator = 0`.
+   - Clamped accumulator to 0.1s (`this.accumulator = Math.min(this.accumulator + dt, 0.1)`)
+     preventing the fixed-step "spiral of death" during page loads or tab switching.
+   - Replaced HUD FPS formula with a true rolling 300 ms frame counter.
+
+
+================================================================================
+5. SUMMARY OF MODIFIED & CREATED FILES
+================================================================================
+
+- `src/physics/PhysicsWorld.ts` (NEW):
+  Rapier 3D WASM world manager, static trimesh builder, kinematic character controller.
+
+- `src/player/PlayerController.ts` (MODIFIED):
+  Rapier-driven movement, sub-frame interpolation (`prevPosition`, `currentPosition`),
+  snapToGround liftoff management, coyote time, and air momentum.
+
+- `src/player/FollowCamera.ts` (MODIFIED):
+  Public `requestLock()`, synchronized dual-lerp smoothing for eye position and
+  focal target, and configurable `shoulderOffset`.
+
+- `src/core/Input.ts` (MODIFIED):
+  Added 160 ms jump buffer with `consumeJump()` and debounced key tracking.
+
+- `src/core/Game.ts` (MODIFIED):
+  Physics step loop, sub-frame interpolation call before render, high-DPI resize
+  fix (`updateStyle: true`), accumulator clamp, and rolling display FPS counter.
+
+- `index.html` (MODIFIED):
+  CSS canvas full-size constraints (`width: 100% !important; height: 100% !important`),
+  and the floating `#pause-overlay` button UI with keyboard hint.
+
+- `src/main.ts` (MODIFIED):
+  Pointer lock change listener, Escape key debounced re-lock, and Resume button wiring.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+

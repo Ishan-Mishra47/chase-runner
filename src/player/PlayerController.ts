@@ -1,89 +1,90 @@
-import {
-  Box3,
-  Line3,
-  Matrix4,
-  Mesh,
-  Object3D,
-  Vector3,
-} from "three";
+import { Object3D, Vector3 } from "three";
 import type { Character } from "../characters/Character";
 import type { Input } from "../core/Input";
+import type { PhysicsWorld } from "../physics/PhysicsWorld";
+import type RAPIER from "@dimforge/rapier3d-compat";
 
-/** Tuning, in metres/second. The character is 1.20 m tall (README-MAP §9b). */
+/** Tuning, in metres/second. Character is 1.20 m tall. */
 export const MOVE = {
-  walkSpeed: 4.0,
-  runSpeed: 8.5,
-  backSpeed: 1.6,
-  accel: 38,
-  decel: 56,
-  reverseAccel: 70,
-  gravity: -14,
-  jumpSpeed: 5.8,
-  doubleJumpSpeed: 12.0,
-  turnRate: 12,
-  /** Capsule fitted to the character; radius keeps it clear of kerbs. */
+  walkSpeed: 4.5,
+  runSpeed: 9.0,
+  backSpeed: 2.2,
+  accel: 42,
+  decel: 36,
+  reverseAccel: 65,
+  airAccel: 20,
+  airDecel: 8,
+  gravity: -18,
+  jumpSpeed: 7.2,
+  doubleJumpSpeed: 6.8,
+  turnRate: 14,
   radius: 0.22,
   height: 1.2,
-  /** Slopes flatter than this are ground, anything steeper is a wall. */
-  maxGroundNormalY: 0.55,
-  /** Kerbs are 0.15 m; step over anything up to this without jumping. */
-  stepHeight: 0.22,
 } as const;
 
-const _box = new Box3();
-const _seg = new Line3();
-const _tri = new Vector3();
-const _cap = new Vector3();
-const _delta = new Vector3();
-const _mat = new Matrix4();
-const _v = new Vector3();
-const _corr = new Vector3();
-const _stepPos = new Vector3();
-const _stepCorr = new Vector3();
 const _up = new Vector3(0, 1, 0);
 
-/**
- * Local, client-side movement: capsule-vs-BVH collision plus a camera-relative
- * input basis. Server authority (build plan §Server Authority) replaces the
- * position it produces later — this is the prediction half of that split.
- */
 export class PlayerController {
   readonly object = new Object3D();
   readonly velocity = new Vector3();
+  readonly prevPosition = new Vector3();
+  readonly currentPosition = new Vector3();
   grounded = false;
 
-  /** Capsule in local space: a vertical segment plus MOVE.radius. */
-  private capsule = new Line3(
-    new Vector3(0, MOVE.radius, 0),
-    new Vector3(0, MOVE.height - MOVE.radius, 0),
-  );
   private facing = 0;
-  private wasGrounded = true;
   private jumpsUsed = 0;
   private jumpAnimationActive = false;
+  private verticalVelocity = 0;
+  private coyoteTimer = 0;
+
+  private body: RAPIER.RigidBody;
+  private collider: RAPIER.Collider;
+  private controller: RAPIER.KinematicCharacterController;
 
   constructor(
     private character: Character,
-    private collider: Mesh,
+    private physics: PhysicsWorld,
   ) {
     this.object.add(character.root);
+
+    const halfHeight = (MOVE.height - 2 * MOVE.radius) / 2; // 0.38m
+    const { body, collider, controller } = this.physics.createCharacter(
+      new Vector3(0, 0, 0),
+      halfHeight,
+      MOVE.radius,
+    );
+    this.body = body;
+    this.collider = collider;
+    this.controller = controller;
   }
 
   spawn(position: Vector3, facing = 0) {
+    this.prevPosition.copy(position);
+    this.currentPosition.copy(position);
     this.object.position.copy(position);
     this.velocity.set(0, 0, 0);
+    this.verticalVelocity = 0;
     this.facing = facing;
     this.jumpsUsed = 0;
     this.jumpAnimationActive = false;
+    this.grounded = false;
+    this.coyoteTimer = 0;
     this.object.rotation.y = facing;
+
+    this.body.setTranslation(
+      { x: position.x, y: position.y, z: position.z },
+      true,
+    );
+    this.controller.enableSnapToGround(0.35);
   }
 
   update(dt: number, input: Input, cameraYaw: number) {
+    this.prevPosition.copy(this.currentPosition);
+
     const move = input.update();
     const wantsMove = move.lengthSq() > 1e-4;
 
-    // FollowCamera orbits at target + offset and looks back at target, so the
-    // camera facing is the negative of that horizontal orbit offset.
+    // FollowCamera orbits at target + offset; facing is negative horizontal orbit
     const forwardX = -Math.sin(cameraYaw);
     const forwardZ = -Math.cos(cameraYaw);
     const rightX = Math.cos(cameraYaw);
@@ -100,41 +101,107 @@ export class PlayerController {
 
     const desiredX = wantsMove ? dirX * target : 0;
     const desiredZ = wantsMove ? dirZ * target : 0;
+
+    // Use responsive air acceleration / deceleration when jumping
+    const accelRate = this.grounded ? MOVE.accel : MOVE.airAccel;
+    const decelRate = this.grounded ? MOVE.decel : MOVE.airDecel;
+    const reverseRate = this.grounded ? MOVE.reverseAccel : MOVE.airAccel;
+
     const rateX =
       desiredX === 0
-        ? MOVE.decel
+        ? decelRate
         : Math.sign(desiredX) !== Math.sign(this.velocity.x)
-          ? MOVE.reverseAccel
-          : MOVE.accel;
+          ? reverseRate
+          : accelRate;
     const rateZ =
       desiredZ === 0
-        ? MOVE.decel
+        ? decelRate
         : Math.sign(desiredZ) !== Math.sign(this.velocity.z)
-          ? MOVE.reverseAccel
-          : MOVE.accel;
+          ? reverseRate
+          : accelRate;
+
     this.velocity.x += (desiredX - this.velocity.x) * (1 - Math.exp(-rateX * dt));
     this.velocity.z += (desiredZ - this.velocity.z) * (1 - Math.exp(-rateZ * dt));
 
-    if (this.grounded) this.jumpsUsed = 0;
-
-    if (input.jump && (this.grounded || this.jumpsUsed < 2)) {
-      const firstJump = this.jumpsUsed === 0;
-      this.velocity.y = firstJump ? MOVE.jumpSpeed : MOVE.doubleJumpSpeed;
-      this.jumpsUsed += 1;
-      this.grounded = false;
-      this.jumpAnimationActive = true;
-      this.character.play("Jump", 0.05);
+    // Coyote timer allows jumps up to 120ms after stepping off a ledge
+    if (this.grounded) {
+      this.coyoteTimer = 0.12;
+      this.jumpsUsed = 0;
+    } else {
+      this.coyoteTimer = Math.max(0, this.coyoteTimer - dt);
     }
-    // Gravity every frame, even when grounded: the capsule has to keep pressing
-    // into the floor for the push-out to report contact. Zeroing it while
-    // standing makes `grounded` flicker on and off.
-    this.velocity.y += MOVE.gravity * dt;
 
-    this.object.position.addScaledVector(this.velocity, dt);
-    this.resolveCollisions(dt);
-    if (this.grounded) this.jumpAnimationActive = false;
+    // Jump handling with 160ms input buffering
+    const wantsJump = input.consumeJump();
+    const canGroundJump = this.grounded || this.coyoteTimer > 0;
+    const canAirJump = this.jumpsUsed < 2;
 
-    // Face the direction of travel; backing up keeps the body forward.
+    if (wantsJump && (canGroundJump || canAirJump)) {
+      const isFirst = canGroundJump;
+      this.verticalVelocity = isFirst ? MOVE.jumpSpeed : MOVE.doubleJumpSpeed;
+      this.jumpsUsed = isFirst ? 1 : this.jumpsUsed + 1;
+      this.grounded = false;
+      this.coyoteTimer = 0;
+      this.jumpAnimationActive = true;
+      this.controller.disableSnapToGround();
+      this.character.play("Jump", 0.04);
+    }
+
+    // Apply gravity
+    this.verticalVelocity += MOVE.gravity * dt;
+    this.verticalVelocity = Math.max(this.verticalVelocity, -28); // terminal velocity
+
+    // Desired translation delta for this frame
+    const desiredDelta = {
+      x: this.velocity.x * dt,
+      y: this.verticalVelocity * dt,
+      z: this.velocity.z * dt,
+    };
+
+    // Rapier computes character movement with slope sliding and autostep
+    this.controller.computeColliderMovement(this.collider, desiredDelta);
+    const computedMovement = this.controller.computedMovement();
+
+    // Update body position in Rapier
+    const currentTranslation = this.body.translation();
+    const newTranslation = {
+      x: currentTranslation.x + computedMovement.x,
+      y: currentTranslation.y + computedMovement.y,
+      z: currentTranslation.z + computedMovement.z,
+    };
+    this.body.setTranslation(newTranslation, true);
+
+    // Sync Three.js character object position
+    this.currentPosition.set(
+      newTranslation.x,
+      newTranslation.y,
+      newTranslation.z,
+    );
+    this.object.position.copy(this.currentPosition);
+
+    // Ground & ceiling resolution
+    if (this.verticalVelocity > 0) {
+      // Moving upwards: cannot be grounded
+      this.grounded = false;
+      if (desiredDelta.y > 0.02 && computedMovement.y < 0.005) {
+        // Hit ceiling
+        this.verticalVelocity = 0;
+      }
+    } else {
+      // Falling or flat: check ground contact
+      const wasGroundedBefore = this.grounded;
+      this.grounded = this.controller.computedGrounded();
+      if (this.grounded) {
+        this.verticalVelocity = 0;
+        this.jumpAnimationActive = false;
+        if (!wasGroundedBefore) {
+          this.controller.enableSnapToGround(0.35);
+        }
+      }
+    }
+    this.velocity.y = this.verticalVelocity;
+
+    // Face the direction of travel
     if (wantsMove) {
       const heading = backing
         ? Math.atan2(-dirX, -dirZ)
@@ -144,113 +211,42 @@ export class PlayerController {
     }
 
     this.updateAnimation(wantsMove, backing, input.sprint);
-    this.wasGrounded = this.grounded;
+
+    // Fell through the world guard
+    if (this.object.position.y < -25) {
+      this.spawn(new Vector3(0, 2, 20), this.facing);
+    }
   }
 
   private updateAnimation(moving: boolean, backing: boolean, sprint: boolean) {
     const speed = Math.hypot(this.velocity.x, this.velocity.z);
     if (this.jumpAnimationActive) {
-      if (this.character.state !== "Jump") this.character.play("JumpUp", 0.1);
+      if (this.character.state !== "Jump") this.character.play("JumpUp", 0.08);
       return;
     }
 
     if (!moving) {
-      this.character.play("Idle");
+      this.character.play("Idle", 0.15);
       this.character.setLocomotionSpeed(1);
       return;
     }
     if (backing) {
-      this.character.play("WalkBack");
+      this.character.play("WalkBack", 0.15);
       this.character.setLocomotionSpeed(speed / MOVE.backSpeed);
       return;
     }
     if (sprint) {
-      this.character.play("Run");
+      this.character.play("Run", 0.15);
       this.character.setLocomotionSpeed(Math.max(speed / MOVE.runSpeed, 0.1));
     } else {
-      this.character.play("Walk");
+      this.character.play("Walk", 0.15);
       this.character.setLocomotionSpeed(Math.max(speed / MOVE.walkSpeed, 0.1));
     }
   }
 
-  /**
-   * Push the capsule out of the merged map geometry. One pass is enough at
-   * these speeds; the accumulated correction tells us whether we landed.
-   */
-  private resolveCollisions(dt: number) {
-    const geom = this.collider.geometry;
-    if (!geom.boundsTree) return;
-
-    this.solveCapsulePenetration(this.object.position, _corr);
-
-    // Step-up: when horizontal motion is blocked, try lifting by a small fixed
-    // amount and solving again. This handles stair risers and kerbs without a
-    // dedicated stair collider path.
-    const horizontalPush = Math.hypot(_corr.x, _corr.z);
-    const movingForward = Math.hypot(this.velocity.x, this.velocity.z) > 0.2;
-    const fallingOrGrounded = this.velocity.y <= 0.25;
-    if (this.wasGrounded && movingForward && fallingOrGrounded && horizontalPush > 0.03) {
-      _stepPos.copy(this.object.position).addScaledVector(_up, MOVE.stepHeight);
-      this.solveCapsulePenetration(_stepPos, _stepCorr);
-      _stepPos.add(_stepCorr);
-
-      const stepPush = Math.hypot(_stepCorr.x, _stepCorr.z);
-      const steppedUp = _stepPos.y - this.object.position.y;
-      const acceptableStep = steppedUp > 0 && steppedUp <= MOVE.stepHeight + 0.06;
-      if (acceptableStep && stepPush + 0.01 < horizontalPush) {
-        _corr.copy(_stepPos).sub(this.object.position);
-      }
-    }
-
-    this.object.position.add(_corr);
-
-    // Standing on something: the push-out undid most of this frame's fall, and
-    // it pushed up rather than sideways.
-    const lift = _corr.y;
-    const len = _corr.length();
-    this.grounded =
-      lift > Math.abs(dt * this.velocity.y * 0.25) &&
-      lift / Math.max(len, 1e-6) > MOVE.maxGroundNormalY;
-
-    if (this.grounded) this.velocity.y = 0;
-    else if (lift < -1e-5) this.velocity.y = Math.min(this.velocity.y, 0); // bonked a ceiling
-
-    // Fell through the world (there is no floor outside the map edge).
-    if (this.object.position.y < -25) {
-      this.object.position.y = 25;
-      this.velocity.set(0, 0, 0);
-    }
-  }
-
-  private solveCapsulePenetration(position: Vector3, out: Vector3) {
-    // Work in the collider's local space (it is at the origin, but stay honest).
-    _mat.copy(this.collider.matrixWorld).invert();
-    _seg.copy(this.capsule);
-    _seg.start.add(position).applyMatrix4(_mat);
-    _seg.end.add(position).applyMatrix4(_mat);
-
-    _box.makeEmpty();
-    _box.expandByPoint(_seg.start);
-    _box.expandByPoint(_seg.end);
-    _box.expandByScalar(MOVE.radius);
-
-    const before = _v.copy(_seg.start);
-
-    this.collider.geometry.boundsTree!.shapecast({
-      intersectsBounds: (box) => box.intersectsBox(_box),
-      intersectsTriangle: (tri) => {
-        const dist = tri.closestPointToSegment(_seg, _tri, _cap);
-        if (dist < MOVE.radius) {
-          const depth = MOVE.radius - dist;
-          _delta.copy(_cap).sub(_tri).normalize();
-          _seg.start.addScaledVector(_delta, depth);
-          _seg.end.addScaledVector(_delta, depth);
-        }
-        return false;
-      },
-    });
-
-    out.copy(_seg.start).sub(before);
+  /** Interpolate between previous and current physics ticks for buttery smooth rendering */
+  interpolate(alpha: number) {
+    this.object.position.lerpVectors(this.prevPosition, this.currentPosition, alpha);
   }
 }
 

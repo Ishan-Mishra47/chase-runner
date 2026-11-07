@@ -14,7 +14,7 @@ import { join } from "node:path";
 const URL_ = process.argv[2] ?? "http://localhost:5173/";
 const OUT = process.argv[3] ?? "shot.png";
 const KEYS = process.argv.slice(4); // e.g. KeyW:2000 = hold W for 2 s
-const PORT = 9223;
+const PORT = Number(process.env.PORT ?? 9223);
 const CHROME =
   process.env.CHROME ??
   "C:/Program Files/Google/Chrome/Application/chrome.exe";
@@ -60,10 +60,11 @@ async function evaluate(expression) {
 }
 
 async function key(type, code, windowsVirtualKeyCode) {
+  const k = code === "Space" ? " " : code.replace("Key", "").toLowerCase();
   await send("Input.dispatchKeyEvent", {
     type,
     code,
-    key: code.replace("Key", "").toLowerCase(),
+    key: k,
     windowsVirtualKeyCode,
     nativeVirtualKeyCode: windowsVirtualKeyCode,
   });
@@ -154,9 +155,9 @@ for (const spec of KEYS) {
     continue;
   }
   const [code, ms] = spec.split(":");
-  await key("keyDown", code, VK[code] ?? 0);
+  await evaluate(`window.dispatchEvent(new KeyboardEvent('keydown', { code: '${code}', bubbles: true }))`);
   await sleep(Number(ms ?? 500));
-  await key("keyUp", code, VK[code] ?? 0);
+  await evaluate(`window.dispatchEvent(new KeyboardEvent('keyup', { code: '${code}', bubbles: true }))`);
   await sleep(200);
 }
 if (ready) await sleep(1000);

@@ -13,6 +13,7 @@ import {
   WebGLRenderer,
 } from "three";
 import { acceleratedRaycast } from "three-mesh-bvh";
+import { PhysicsWorld } from "../physics/PhysicsWorld";
 import { loadMap, type GameMap } from "../map/MapLoader";
 import {
   CHASER_COLOURS,
@@ -44,11 +45,15 @@ export class Game {
   private clock = new Clock();
   private input = new Input();
   private cam: FollowCamera;
+  private physics?: PhysicsWorld;
   private player?: PlayerController;
   private map?: GameMap;
   private hud: HTMLElement;
   private accumulator = 0;
   private readonly fixedStep = 1 / 60;
+  private frameCount = 0;
+  private fpsTimer = 0;
+  private currentFps = 60;
 
   constructor(
     private container: HTMLElement,
@@ -93,6 +98,9 @@ export class Game {
   private sun!: DirectionalLight;
 
   async load(onProgress?: (label: string, f: number) => void) {
+    onProgress?.("physics", 0);
+    this.physics = await PhysicsWorld.create();
+
     onProgress?.("map", 0);
     this.map = await loadMap("/models/map.glb", (f) => onProgress?.("map", f));
     this.scene.add(this.map.scene, this.map.collision);
@@ -102,6 +110,7 @@ export class Game {
         o.receiveShadow = true;
       }
     });
+    this.physics.createMapCollider(this.map.collision.geometry);
 
     onProgress?.("character", 0);
     // ?char=… swaps the model without a rebuild, for comparing export settings.
@@ -117,17 +126,12 @@ export class Game {
     character.setColours(
       this.role === "chaser" ? CHASER_COLOURS : RUNNER_COLOURS[0],
     );
-    this.player = new PlayerController(character, this.map.collision);
+    this.player = new PlayerController(character, this.physics);
     this.character = character;
     this.scene.add(this.player.object);
 
-    const spawn =
-      this.map.spawns.find((s) => s.role === "runner") ?? this.map.spawns[0];
-    // Spawn a little high and let gravity settle the capsule onto the ground —
-    // the spawn empties are placeholders (README-MAP §9 item 6).
-    this.player.spawn(
-      spawn ? spawn.position.clone().setY(spawn.position.y + 0.5) : new Vector3(0, 2, 20),
-    );
+    // Spawn in the wide-open park promenade where there are no benches or obstructions.
+    this.player.spawn(new Vector3(0, 2, 20));
     this.tiles = new TileManager(this.map);
     // Phase lengths are admin config; until the lobby UI exists they can be
     // overridden per-load (?scatter=2&settle=1&hunt=10) for testing.
@@ -180,24 +184,40 @@ export class Game {
   }
 
   start() {
+    this.clock.start();
+    this.accumulator = 0;
+    this.frameCount = 0;
+    this.fpsTimer = 0;
     this.renderer.setAnimationLoop(() => this.frame());
   }
 
   private frame() {
     const dt = Math.min(this.clock.getDelta(), 0.1);
 
-    // Fixed-step simulation: the server will run the same step, so prediction
-    // and authority stay comparable.
-    this.accumulator += dt;
+    this.frameCount++;
+    this.fpsTimer += dt;
+    if (this.fpsTimer >= 0.3) {
+      this.currentFps = Math.round(this.frameCount / this.fpsTimer);
+      this.frameCount = 0;
+      this.fpsTimer = 0;
+    }
+
+    // Fixed-step simulation: cap accumulator to 0.1s to avoid death spirals
+    this.accumulator = Math.min(this.accumulator + dt, 0.1);
     let steps = 0;
-    while (this.accumulator >= this.fixedStep && steps < 5) {
+    while (this.accumulator >= this.fixedStep && steps < 4) {
       const yaw = (this.input.held("KeyE") ? -1 : 0) + (this.input.held("KeyQ") ? 1 : 0);
       this.cam.yaw += yaw * this.fixedStep * 1.8;
       this.player?.update(this.fixedStep, this.input, this.cam.yaw);
+      this.physics?.step(this.fixedStep);
       this.accumulator -= this.fixedStep;
       steps++;
     }
     this.input.endFrame();
+
+    // Interpolate player object between physics ticks for buttery smooth rendering
+    const alpha = Math.min(this.accumulator / this.fixedStep, 1.0);
+    this.player?.interpolate(alpha);
 
     this.match?.update(dt);
     this.updateSafety();
@@ -242,7 +262,7 @@ export class Game {
     const m = this.match;
     const clock = m && m.remaining !== Infinity ? `${m.remaining.toFixed(1)}s` : "--";
     this.hud.textContent =
-      `${(1 / Math.max(dt, 1e-6)).toFixed(0)} fps\n` +
+      `${this.currentFps} fps\n` +
       `role  ${this.role}\n` +
       `phase ${m?.phase ?? "-"}  ${clock}  colour ${m?.chaserColour ?? "-"}\n` +
       `tile  ${this.holding?.id ?? "none"}  ${this.safe ? "SAFE" : "exposed"}` +
@@ -259,7 +279,15 @@ export class Game {
   private resize() {
     const w = this.container.clientWidth || innerWidth;
     const h = this.container.clientHeight || innerHeight;
-    this.renderer.setSize(w, h, false);
+    this.renderer.setSize(w, h, true);
     this.cam.resize(w, h);
+  }
+
+  get canvas(): HTMLCanvasElement {
+    return this.renderer.domElement;
+  }
+
+  requestPointerLock() {
+    this.cam.requestLock();
   }
 }

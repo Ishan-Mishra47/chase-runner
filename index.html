@@ -17,6 +17,12 @@
       #app {
         position: fixed;
         inset: 0;
+        overflow: hidden;
+      }
+      #app canvas {
+        display: block;
+        width: 100% !important;
+        height: 100% !important;
       }
       #hud {
         position: fixed;
@@ -38,11 +44,65 @@
         opacity: 0;
         pointer-events: none;
       }
+      #pause-overlay {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        z-index: 10;
+        transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+        pointer-events: auto;
+      }
+      #pause-overlay.locked {
+        opacity: 0;
+        pointer-events: none;
+        transform: translate(-50%, 12px);
+      }
+      #lock-btn {
+        background: #2563eb;
+        color: #ffffff;
+        border: none;
+        padding: 10px 22px;
+        font: 600 13px/1.2 ui-sans-serif, system-ui, -apple-system, sans-serif;
+        border-radius: 9999px;
+        cursor: pointer;
+        box-shadow: 0 4px 14px rgba(37, 99, 235, 0.4), 0 2px 4px rgba(0,0,0,0.2);
+        transition: background 0.15s, transform 0.1s;
+        letter-spacing: 0.02em;
+      }
+      #lock-btn:hover {
+        background: #1d4ed8;
+        transform: scale(1.03);
+      }
+      #lock-btn:active {
+        transform: scale(0.97);
+      }
+      .lock-hint {
+        font-size: 11px;
+        color: #94a3b8;
+        text-shadow: 0 1px 2px #000;
+      }
+      .lock-hint kbd {
+        background: #334155;
+        color: #f8fafc;
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-family: inherit;
+        border: 1px solid #475569;
+      }
     </style>
   </head>
   <body>
     <div id="app"></div>
     <div id="hud"></div>
+    <div id="pause-overlay">
+      <button id="lock-btn">▶ Resume Game (Lock Cursor)</button>
+      <div class="lock-hint">Click or press <kbd>Esc</kbd> to lock cursor · <kbd>Esc</kbd> to release</div>
+    </div>
     <div id="loading">loading…</div>
     <script type="module" src="/src/main.ts"></script>
   </body>
